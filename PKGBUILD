@@ -1,33 +1,65 @@
-# Maintainer: zxp19821005 <zxp19821005 at 163 dot com>
-pkgname="apifox-appimage"
-pkgver=2.3.1
+# Maintainer: DBeidachazi <a269502169@gmail.com>
+pkgname=apifox-appimage
+pkgver=2.7.48  # 注意：如果安装后发现版本不对，请手动修改这里
 pkgrel=1
-pkgdesc="Apifox=Postman+Swagger+Mock+JMeter.API 文档、API 调试、API Mock、API 自动化测试"
+pkgdesc="Apifox - API documentation, debugging, mocking, and testing tool (AppImage in Zip)"
 arch=('x86_64')
-url="https://apifox.com/"
-license=('custom')
-conflicts=("${pkgname%-appimage}")
-providers=("${pkgname%-appimage}")
-depends=('hicolor-icon-theme' 'zlib' 'glibc')
-options=(!strip)
-_install_path="/opt/appimages"
-source=("${pkgname%-appimage}-${pkgver}.zip::https://cdn.apifox.cn/download/Apifox-linux-latest.zip"
-  "LICENSE.html::${url}/help/app/faq/")
-sha256sums=('cbcfb6ba7409c4bd1a3edd9cefed7ec59f8157a62b2288a040c8a55d41a5ec29'
-            'e0ab26c0ec96a3a0c2e8d89a59200eaeff05b2f7964b4f6f06871e8e5f5e0629')
-   
+url="https://apifox.com"
+license=('Proprietary')
+# AppImage 运行通常依赖 fuse2，图形界面依赖标准库
+depends=('fuse2' 'zlib' 'hicolor-icon-theme' 'desktop-file-utils') 
+conflicts=('apifox' 'apifox-bin' 'apifox-appimage')
+provides=('apifox')
+options=('!strip')
+
+# 使用官方 latest 链接
+source=("https://file-assets.apifox.com/download/Apifox-linux-latest.zip")
+# 跳过校验，因为 latest 文件内容会变
+sha256sums=('SKIP') 
+
 prepare() {
-    chmod a+x "Apifox.AppImage"
-    "./Apifox.AppImage" --appimage-extract > /dev/null
-    sed 's|AppRun|${_install_path}/${pkgname%-appimage}.AppImage|g;s|Utility|Utility;Development|g' -i "${srcdir}/squashfs-root/${pkgname%-appimage}.desktop"
+    # 1. 自动解压后，我们需要找到那个 AppImage 文件
+    # 因为文件名可能带版本号也可能不带，我们用通配符找
+    local _appimage=$(find . -maxdepth 1 -name "*.AppImage" -print -quit)
+    
+    if [ -z "$_appimage" ]; then
+        echo "错误：在 Zip 包中未找到 .AppImage 文件！"
+        exit 1
+    fi
+
+    echo "找到 AppImage 文件: $_appimage"
+    
+    # 2. 赋予执行权限
+    chmod +x "$_appimage"
+
+    # 3. 从 AppImage 中提取 .desktop 文件和图标
+    # 这一步是为了让你的开始菜单能显示图标
+    ./"$_appimage" --appimage-extract "apifox.desktop"
+    ./"$_appimage" --appimage-extract "usr/share/icons/hicolor/512x512/apps/apifox.png"
+    
+    # 为了方便 package() 阶段调用，重命名一下
+    mv "$_appimage" "apifox.AppImage"
 }
-   
+
 package() {
-    install -Dm755 "${srcdir}/Apifox.AppImage" "${pkgdir}/${_install_path}/${pkgname%-appimage}.AppImage"
-    for _icons in 16x16 32x32 48x48 64x64 128x128 256x256 512x512;do
-      install -Dm644 "${srcdir}/squashfs-root/usr/share/icons/hicolor/${_icons}/apps/${pkgname%-appimage}.png" \
-        -t "${pkgdir}/usr/share/icons/hicolor/${_icons}/apps"
-    done
-    install -Dm644 "${srcdir}/squashfs-root/${pkgname%-appimage}.desktop" -t "${pkgdir}/usr/share/applications"
-    install -Dm644 "${srcdir}/LICENSE.html" -t "${pkgdir}/usr/share/licenses/${pkgname}"
+    # 1. 安装 AppImage 主程序到 /opt/apifox
+    install -Dm755 "apifox.AppImage" "${pkgdir}/opt/${pkgname}/apifox.AppImage"
+
+    # 2. 创建启动脚本到 /usr/bin
+    mkdir -p "${pkgdir}/usr/bin"
+    echo -e '#!/bin/sh\nexec /opt/'"${pkgname}"'/apifox.AppImage "$@"' > "${pkgdir}/usr/bin/apifox"
+    chmod +x "${pkgdir}/usr/bin/apifox"
+
+    # 3. 安装之前提取出来的 .desktop 文件
+    install -Dm644 "squashfs-root/apifox.desktop" "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+
+    # 4. 修正 .desktop 文件内容
+    # 把 Exec 指向我们创建的 /usr/bin/apifox
+    sed -i "s|^Exec=.*|Exec=apifox %U|" "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+    # 修正图标名称
+    sed -i "s|^Icon=.*|Icon=apifox|" "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+
+    # 5. 安装图标
+    install -Dm644 "squashfs-root/usr/share/icons/hicolor/512x512/apps/apifox.png" \
+        "${pkgdir}/usr/share/icons/hicolor/512x512/apps/apifox.png"
 }
