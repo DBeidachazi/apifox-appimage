@@ -2,7 +2,7 @@
 pkgname=apifox-appimage
 pkgver=2.8.4
 pkgrel=1
-pkgdesc="Apifox - API documentation, debugging, mocking, and testing tool (AppImage in Zip)"
+pkgdesc="Apifox - API documentation, debugging, mocking, and testing tool (AppImage in Zip) API 文档、API 调试、API Mock、API 自动化测试"
 arch=('x86_64')
 url="https://apifox.com"
 license=('Proprietary')
