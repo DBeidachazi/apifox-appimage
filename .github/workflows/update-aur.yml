@@ -1,0 +1,129 @@
+name: Update AUR Package
+
+on:
+  schedule:
+    # 每天 UTC 时间 2:00 运行 (北京时间 10:00)
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get latest Apifox version
+        id: get_version
+        run: |
+          # 下载 zip 文件
+          echo "下载 Apifox zip..."
+          curl -sL "https://file-assets.apifox.com/download/Apifox-linux-latest.zip" -o /tmp/apifox.zip
+
+          # 解压
+          cd /tmp
+          unzip -q apifox.zip
+          chmod +x Apifox.AppImage
+
+          # 从 AppImage 中提取 package.json
+          ./Apifox.AppImage --appimage-extract resources/app.asar.unpacked/package.json
+
+          # 从 package.json 读取版本号
+          VERSION=$(grep -oP '"version":\s*"\K[0-9.]+' squashfs-root/resources/app.asar.unpacked/package.json)
+
+          if [ -z "$VERSION" ]; then
+            echo "无法获取版本号"
+            exit 1
+          fi
+
+          echo "最新版本: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # 清理
+          rm -rf /tmp/apifox.zip /tmp/Apifox.AppImage /tmp/README.md /tmp/squashfs-root
+
+      - name: Get current version from PKGBUILD
+        id: current_version
+        run: |
+          CURRENT=$(grep -oP '^pkgver=\K[0-9.]+' PKGBUILD)
+          echo "当前版本: $CURRENT"
+          echo "version=$CURRENT" >> $GITHUB_OUTPUT
+
+      - name: Check if update needed
+        id: check_update
+        run: |
+          if [ "${{ steps.get_version.outputs.version }}" != "${{ steps.current_version.outputs.version }}" ]; then
+            echo "需要更新: ${{ steps.current_version.outputs.version }} -> ${{ steps.get_version.outputs.version }}"
+            echo "need_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "版本相同，无需更新"
+            echo "need_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update PKGBUILD
+        if: steps.check_update.outputs.need_update == 'true'
+        run: |
+          NEW_VERSION="${{ steps.get_version.outputs.version }}"
+
+          # 更新 PKGBUILD 中的版本号
+          sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" PKGBUILD
+
+      - name: Update .SRCINFO
+        if: steps.check_update.outputs.need_update == 'true'
+        run: |
+          NEW_VERSION="${{ steps.get_version.outputs.version }}"
+
+          # 更新 .SRCINFO 中的版本号
+          sed -i "s/pkgver = .*/pkgver = $NEW_VERSION/" .SRCINFO
+
+      - name: Setup SSH for AUR
+        if: steps.check_update.outputs.need_update == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+
+          # 添加 AUR 到 known_hosts
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+
+          # 配置 SSH
+          cat >> ~/.ssh/config << EOF
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          EOF
+
+      - name: Push to AUR
+        if: steps.check_update.outputs.need_update == 'true'
+        run: |
+          NEW_VERSION="${{ steps.get_version.outputs.version }}"
+
+          # 配置 git
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+
+          # 克隆 AUR 仓库
+          git clone ssh://aur@aur.archlinux.org/apifox-appimage.git /tmp/aur-repo
+
+          # 复制更新后的文件
+          cp PKGBUILD /tmp/aur-repo/
+          cp .SRCINFO /tmp/aur-repo/
+
+          # 提交并推送
+          cd /tmp/aur-repo
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to version $NEW_VERSION"
+          git push
+
+      - name: Commit to GitHub
+        if: steps.check_update.outputs.need_update == 'true'
+        run: |
+          NEW_VERSION="${{ steps.get_version.outputs.version }}"
+
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to version $NEW_VERSION"
+          git push
