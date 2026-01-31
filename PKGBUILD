@@ -13,7 +13,7 @@ provides=('apifox')
 options=('!strip')
 
 # 使用官方 latest 链接
-source=("https://file-assets.apifox.com/download/Apifox-linux-latest.zip")
+source=("Apifox-linux-${pkgver}.zip::https://file-assets.apifox.com/download/Apifox-linux-latest.zip")
 # 跳过校验，因为 latest 文件内容会变
 sha256sums=('SKIP') 
 

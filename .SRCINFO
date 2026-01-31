@@ -14,7 +14,7 @@ pkgbase = apifox-appimage
 	conflicts = apifox-bin
 	conflicts = apifox-appimage
 	options = !strip
-	source = https://file-assets.apifox.com/download/Apifox-linux-latest.zip
+	source = Apifox-linux-2.8.5.zip::https://file-assets.apifox.com/download/Apifox-linux-latest.zip
 	sha256sums = SKIP
 
 pkgname = apifox-appimage
