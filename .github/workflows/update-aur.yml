@@ -132,4 +132,5 @@ jobs:
           git add PKGBUILD .SRCINFO
           # 只在有变化时提交
           git diff --staged --quiet || git commit -m "Update to version $NEW_VERSION"
-          git diff origin/master --quiet || git push
+          git pull --rebase origin master
+          git push
