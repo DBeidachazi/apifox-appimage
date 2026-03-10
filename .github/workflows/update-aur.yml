@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   update:
@@ -20,31 +21,54 @@ jobs:
       - name: Get latest Apifox version
         id: get_version
         run: |
-          # 下载 zip 文件
-          echo "下载 Apifox zip..."
-          curl -sL "https://file-assets.apifox.com/download/Apifox-linux-latest.zip" -o /tmp/apifox.zip
+          for attempt in 1 2 3; do
+            echo "=== 获取版本信息 (第 ${attempt}/3 次尝试) ==="
 
-          # 解压
-          cd /tmp
-          unzip -q apifox.zip
-          chmod +x Apifox.AppImage
+            # 清理上次尝试的残留
+            rm -rf /tmp/apifox.zip /tmp/Apifox.AppImage /tmp/README.md /tmp/squashfs-root
 
-          # 从 AppImage 中提取 package.json
-          ./Apifox.AppImage --appimage-extract resources/app.asar.unpacked/package.json
+            # 下载 zip 文件（curl 自带重试 + 外层重试）
+            echo "下载 Apifox zip..."
+            if ! curl --retry 3 --retry-delay 5 --retry-all-errors -fsSL \
+                 "https://file-assets.apifox.com/download/Apifox-linux-latest.zip" -o /tmp/apifox.zip; then
+              echo "下载失败"
+              if [ $attempt -lt 3 ]; then sleep $((attempt * 15)); continue; fi
+              exit 1
+            fi
 
-          # 从 package.json 读取版本号
-          VERSION=$(grep -oP '"version":\s*"\K[0-9.]+' squashfs-root/resources/app.asar.unpacked/package.json)
+            # 解压
+            cd /tmp
+            if ! unzip -q apifox.zip; then
+              echo "解压失败"
+              if [ $attempt -lt 3 ]; then sleep $((attempt * 15)); continue; fi
+              exit 1
+            fi
 
-          if [ -z "$VERSION" ]; then
-            echo "无法获取版本号"
-            exit 1
-          fi
+            chmod +x Apifox.AppImage
 
-          echo "最新版本: $VERSION"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+            # 从 AppImage 中提取 package.json
+            if ! ./Apifox.AppImage --appimage-extract resources/app.asar.unpacked/package.json; then
+              echo "AppImage 提取失败"
+              if [ $attempt -lt 3 ]; then sleep $((attempt * 15)); continue; fi
+              exit 1
+            fi
 
-          # 清理
-          rm -rf /tmp/apifox.zip /tmp/Apifox.AppImage /tmp/README.md /tmp/squashfs-root
+            # 从 package.json 读取版本号
+            VERSION=$(grep -oP '"version":\s*"\K[0-9.]+' squashfs-root/resources/app.asar.unpacked/package.json)
+
+            if [ -z "$VERSION" ]; then
+              echo "无法获取版本号"
+              if [ $attempt -lt 3 ]; then sleep $((attempt * 15)); continue; fi
+              exit 1
+            fi
+
+            echo "最新版本: $VERSION"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+            # 清理
+            rm -rf /tmp/apifox.zip /tmp/Apifox.AppImage /tmp/README.md /tmp/squashfs-root
+            break
+          done
 
       - name: Get current version from PKGBUILD
         id: current_version
@@ -89,8 +113,15 @@ jobs:
           echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
 
-          # 添加 AUR 到 known_hosts
-          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          # 添加 AUR 到 known_hosts（带重试）
+          for attempt in 1 2 3; do
+            if ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null; then
+              break
+            fi
+            echo "ssh-keyscan 失败 (第 ${attempt}/3 次尝试)"
+            if [ $attempt -lt 3 ]; then sleep $((attempt * 5)); continue; fi
+            exit 1
+          done
 
           # 配置 SSH
           cat >> ~/.ssh/config << EOF
@@ -108,8 +139,16 @@ jobs:
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
 
-          # 克隆 AUR 仓库
-          git clone ssh://aur@aur.archlinux.org/apifox-appimage.git /tmp/aur-repo
+          # 克隆 AUR 仓库（带重试）
+          for attempt in 1 2 3; do
+            if git clone ssh://aur@aur.archlinux.org/apifox-appimage.git /tmp/aur-repo; then
+              break
+            fi
+            echo "AUR 仓库克隆失败 (第 ${attempt}/3 次尝试)"
+            rm -rf /tmp/aur-repo
+            if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done
 
           # 复制更新后的文件
           cp PKGBUILD /tmp/aur-repo/
@@ -119,7 +158,18 @@ jobs:
           cd /tmp/aur-repo
           git add PKGBUILD .SRCINFO
           git diff --staged --quiet || git commit -m "Update to version $NEW_VERSION"
-          git diff origin/master --quiet || git push
+
+          # 推送到 AUR（带重试）
+          if ! git diff origin/master --quiet; then
+            for attempt in 1 2 3; do
+              if git push; then
+                break
+              fi
+              echo "AUR 推送失败 (第 ${attempt}/3 次尝试)"
+              if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
+              exit 1
+            done
+          fi
 
       - name: Commit to GitHub
         if: steps.check_update.outputs.need_update == 'true'
@@ -132,5 +182,32 @@ jobs:
           git add PKGBUILD .SRCINFO
           # 只在有变化时提交
           git diff --staged --quiet || git commit -m "Update to version $NEW_VERSION"
-          git pull --rebase origin master
-          git push
+
+          # 推送到 GitHub（带重试）
+          for attempt in 1 2 3; do
+            if git pull --rebase origin master && git push; then
+              break
+            fi
+            echo "GitHub 推送失败 (第 ${attempt}/3 次尝试)"
+            if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done
+
+  # 工作流级别重试：任何步骤失败后自动重新运行整个工作流（最多 3 次）
+  retry:
+    needs: update
+    if: failure() && github.run_attempt < 3
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: 重新运行失败的任务
+        uses: actions/github-script@v7
+        with:
+          script: |
+            console.log('第 ${{ github.run_attempt }} 次尝试失败，正在触发重试...');
+            await github.rest.actions.rerunWorkflowFailedJobs({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });
