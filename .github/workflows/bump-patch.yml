@@ -53,7 +53,8 @@ jobs:
           NEW_VERSION="${{ steps.bump.outputs.new }}"
           sed -i "s/pkgver = .*/pkgver = $NEW_VERSION/" .SRCINFO
           sed -i "s/pkgrel = .*/pkgrel = 1/" .SRCINFO
-          sed -i "s/source = Apifox-linux-[0-9.]*\.zip/source = Apifox-linux-$NEW_VERSION.zip/" .SRCINFO
+          sed -i "s/source_x86_64 = Apifox-linux-[0-9.]*\.zip/source_x86_64 = Apifox-linux-$NEW_VERSION.zip/" .SRCINFO
+          sed -i "s/source_aarch64 = Apifox-linux-[0-9.]*-arm64\.zip/source_aarch64 = Apifox-linux-$NEW_VERSION-arm64.zip/" .SRCINFO
 
       - name: Setup SSH for AUR
         run: |

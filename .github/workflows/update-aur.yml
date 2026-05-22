@@ -103,8 +103,9 @@ jobs:
 
           # 更新 .SRCINFO 中的版本号
           sed -i "s/pkgver = .*/pkgver = $NEW_VERSION/" .SRCINFO
-          # 更新 source 行中的版本号
-          sed -i "s/source = Apifox-linux-[0-9.]*\.zip/source = Apifox-linux-$NEW_VERSION.zip/" .SRCINFO
+          # 更新两条 source 行中的版本号（x86_64 / aarch64）
+          sed -i "s/source_x86_64 = Apifox-linux-[0-9.]*\.zip/source_x86_64 = Apifox-linux-$NEW_VERSION.zip/" .SRCINFO
+          sed -i "s/source_aarch64 = Apifox-linux-[0-9.]*-arm64\.zip/source_aarch64 = Apifox-linux-$NEW_VERSION-arm64.zip/" .SRCINFO
 
       - name: Setup SSH for AUR
         if: steps.check_update.outputs.need_update == 'true'
