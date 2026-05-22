@@ -1,0 +1,151 @@
+name: Bump Patch Version
+
+on:
+  workflow_dispatch:  # 仅手动触发
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute new patch version
+        id: bump
+        run: |
+          CURRENT=$(grep -oP '^pkgver=\K[0-9.]+' PKGBUILD)
+          echo "当前版本: $CURRENT"
+
+          # 统计版本号的段数（用点的数量 + 1）
+          DOTS=$(echo -n "$CURRENT" | tr -cd '.' | wc -c)
+          SEGMENTS=$((DOTS + 1))
+
+          if [ "$SEGMENTS" -eq 3 ]; then
+            # 三段：X.Y.Z -> X.Y.Z.1
+            NEW="${CURRENT}.1"
+          elif [ "$SEGMENTS" -eq 4 ]; then
+            # 四段：X.Y.Z.N -> X.Y.Z.(N+1)
+            BASE=$(echo "$CURRENT" | awk -F. '{print $1"."$2"."$3}')
+            LAST=$(echo "$CURRENT" | awk -F. '{print $4}')
+            NEW="${BASE}.$((LAST + 1))"
+          else
+            echo "不支持的版本格式: $CURRENT（仅支持三段或四段）"
+            exit 1
+          fi
+
+          echo "新版本: $NEW"
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "new=$NEW" >> $GITHUB_OUTPUT
+
+      - name: Update PKGBUILD
+        run: |
+          NEW_VERSION="${{ steps.bump.outputs.new }}"
+          sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+
+      - name: Update .SRCINFO
+        run: |
+          NEW_VERSION="${{ steps.bump.outputs.new }}"
+          sed -i "s/pkgver = .*/pkgver = $NEW_VERSION/" .SRCINFO
+          sed -i "s/pkgrel = .*/pkgrel = 1/" .SRCINFO
+          sed -i "s/source = Apifox-linux-[0-9.]*\.zip/source = Apifox-linux-$NEW_VERSION.zip/" .SRCINFO
+
+      - name: Setup SSH for AUR
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+
+          # 添加 AUR 到 known_hosts（带重试）
+          for attempt in 1 2 3; do
+            if ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null; then
+              break
+            fi
+            echo "ssh-keyscan 失败 (第 ${attempt}/3 次尝试)"
+            if [ $attempt -lt 3 ]; then sleep $((attempt * 5)); continue; fi
+            exit 1
+          done
+
+          cat >> ~/.ssh/config << EOF
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          EOF
+
+      - name: Push to AUR
+        run: |
+          NEW_VERSION="${{ steps.bump.outputs.new }}"
+
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+
+          # 克隆 AUR 仓库（带重试）
+          for attempt in 1 2 3; do
+            if git clone ssh://aur@aur.archlinux.org/apifox-appimage.git /tmp/aur-repo; then
+              break
+            fi
+            echo "AUR 仓库克隆失败 (第 ${attempt}/3 次尝试)"
+            rm -rf /tmp/aur-repo
+            if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done
+
+          cp PKGBUILD /tmp/aur-repo/
+          cp .SRCINFO /tmp/aur-repo/
+
+          cd /tmp/aur-repo
+          git add PKGBUILD .SRCINFO
+          git diff --staged --quiet || git commit -m "Bump patch to $NEW_VERSION"
+
+          if ! git diff origin/master --quiet; then
+            for attempt in 1 2 3; do
+              if git push; then
+                break
+              fi
+              echo "AUR 推送失败 (第 ${attempt}/3 次尝试)"
+              if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
+              exit 1
+            done
+          fi
+
+      - name: Commit to GitHub
+        run: |
+          NEW_VERSION="${{ steps.bump.outputs.new }}"
+
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+          git add PKGBUILD .SRCINFO
+          git diff --staged --quiet || git commit -m "Bump patch to $NEW_VERSION"
+
+          for attempt in 1 2 3; do
+            if git pull --rebase origin master && git push; then
+              break
+            fi
+            echo "GitHub 推送失败 (第 ${attempt}/3 次尝试)"
+            if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done
+
+  retry:
+    needs: bump
+    if: failure() && github.run_attempt < 3
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: 重新运行失败的任务
+        uses: actions/github-script@v7
+        with:
+          script: |
+            console.log('第 ${{ github.run_attempt }} 次尝试失败，正在触发重试...');
+            await github.rest.actions.rerunWorkflowFailedJobs({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });
