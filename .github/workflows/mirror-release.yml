@@ -1,0 +1,204 @@
+name: Mirror Apifox Release
+
+on:
+  schedule:
+    # 每天 UTC 时间 1:00 运行 (北京时间 9:00)
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/scripts/download-and-validate.sh
+      - .github/workflows/mirror-release.yml
+
+permissions:
+  contents: write
+
+env:
+  X86_64_DOWNLOAD_URL: https://file-assets.apifox.com/download/Apifox-linux-latest.zip
+  AARCH64_DOWNLOAD_URL: https://file-assets.apifox.com/download/Apifox-linux-arm64-latest.zip
+  # 正常安装包远大于 100 MiB。拒绝 CDN 拦截页等体积异常的响应。
+  MIN_ZIP_SIZE: 104857600
+
+concurrency:
+  group: apifox-release-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download and inspect latest x86_64 package
+        id: latest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK_DIR="$RUNNER_TEMP/apifox-release"
+          X86_64_ZIP="$WORK_DIR/Apifox-linux-latest.zip"
+          mkdir -p "$WORK_DIR"
+
+          bash .github/scripts/download-and-validate.sh \
+            "$X86_64_DOWNLOAD_URL" "$X86_64_ZIP" "x86_64 ZIP"
+
+          APPIMAGE_ENTRY=$(unzip -Z1 "$X86_64_ZIP" | awk '/(^|\/)Apifox[^\/]*\.AppImage$/ && !found { print; found=1 }')
+          APPIMAGE="$WORK_DIR/Apifox.AppImage"
+          unzip -p "$X86_64_ZIP" "$APPIMAGE_ENTRY" > "$APPIMAGE"
+          chmod +x "$APPIMAGE"
+
+          mkdir -p "$WORK_DIR/version"
+          cd "$WORK_DIR/version"
+          "$APPIMAGE" --appimage-extract resources/app.asar.unpacked/package.json >/dev/null
+          PACKAGE_JSON="$WORK_DIR/version/squashfs-root/resources/app.asar.unpacked/package.json"
+          VERSION=$(jq -r '.version // empty' "$PACKAGE_JSON")
+
+          if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "错误: 无法从 AppImage 获取有效版本号: ${VERSION:-空}"
+            exit 1
+          fi
+
+          VERSIONED_X86_64_ZIP="$WORK_DIR/Apifox-linux-${VERSION}.zip"
+          mv "$X86_64_ZIP" "$VERSIONED_X86_64_ZIP"
+
+          echo "最新版本: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "work_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+          echo "x86_64_zip=$VERSIONED_X86_64_ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Check existing GitHub release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.latest.outputs.version }}
+          WORK_DIR: ${{ steps.latest.outputs.work_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT_VERSION=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          HIGHEST_KNOWN_VERSION=$(
+            {
+              echo "$CURRENT_VERSION"
+              gh release list --limit 100 --json tagName \
+                --jq '.[] | .tagName | select(test("^v?[0-9]+(\\.[0-9]+)+$")) | sub("^v"; "")'
+            } | sort -V | tail -n 1
+          )
+
+          if [[ "$VERSION" != "$HIGHEST_KNOWN_VERSION" ]]; then
+            HIGHEST_VERSION=$(printf '%s\n%s\n' "$VERSION" "$HIGHEST_KNOWN_VERSION" | sort -V | tail -n 1)
+            if [[ "$HIGHEST_VERSION" != "$VERSION" ]]; then
+              echo "错误: 官网返回的版本 $VERSION 低于已知版本 $HIGHEST_KNOWN_VERSION，拒绝发布旧包"
+              exit 1
+            fi
+          fi
+
+          TAG="v${VERSION}"
+          X86_64_NAME="Apifox-linux-${VERSION}.zip"
+          AARCH64_NAME="Apifox-linux-${VERSION}-arm64.zip"
+          RELEASE_DIR="$WORK_DIR/existing-release"
+          RELEASE_COMPLETE=false
+          mkdir -p "$RELEASE_DIR"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            X86_64_SIZE=$(gh release view "$TAG" --json assets \
+              --jq ".assets[] | select(.name == \"${X86_64_NAME}\") | .size")
+            AARCH64_SIZE=$(gh release view "$TAG" --json assets \
+              --jq ".assets[] | select(.name == \"${AARCH64_NAME}\") | .size")
+
+            if [[ "${X86_64_SIZE:-0}" -ge "$MIN_ZIP_SIZE" && \
+                  "${AARCH64_SIZE:-0}" -ge "$MIN_ZIP_SIZE" ]] && \
+               gh release download "$TAG" --pattern SHA256SUMS --dir "$RELEASE_DIR"; then
+              X86_64_SHA256=$(awk -v name="$X86_64_NAME" '$2 == name { print $1 }' "$RELEASE_DIR/SHA256SUMS")
+              AARCH64_SHA256=$(awk -v name="$AARCH64_NAME" '$2 == name { print $1 }' "$RELEASE_DIR/SHA256SUMS")
+
+              if [[ "$X86_64_SHA256" =~ ^[0-9a-f]{64}$ && \
+                    "$AARCH64_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+                RELEASE_COMPLETE=true
+              fi
+            fi
+          fi
+
+          echo "Release $TAG 完整: $RELEASE_COMPLETE"
+          if [[ "$RELEASE_COMPLETE" == true ]]; then
+            echo "need_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "need_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and validate aarch64 package
+        id: assets
+        if: steps.release.outputs.need_publish == 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          WORK_DIR: ${{ steps.latest.outputs.work_dir }}
+          X86_64_ZIP: ${{ steps.latest.outputs.x86_64_zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AARCH64_ZIP="$WORK_DIR/Apifox-linux-${VERSION}-arm64.zip"
+          bash .github/scripts/download-and-validate.sh \
+            "$AARCH64_DOWNLOAD_URL" "$AARCH64_ZIP" "aarch64 ZIP"
+
+          (
+            cd "$WORK_DIR"
+            sha256sum "$(basename "$X86_64_ZIP")" "$(basename "$AARCH64_ZIP")" > SHA256SUMS
+          )
+
+          echo "aarch64_zip=$AARCH64_ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release assets
+        if: steps.release.outputs.need_publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.latest.outputs.version }}
+          WORK_DIR: ${{ steps.latest.outputs.work_dir }}
+          X86_64_ZIP: ${{ steps.latest.outputs.x86_64_zip }}
+          AARCH64_ZIP: ${{ steps.assets.outputs.aarch64_zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="v${VERSION}"
+          X86_64_NAME=$(basename "$X86_64_ZIP")
+          AARCH64_NAME=$(basename "$AARCH64_ZIP")
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --target "$GITHUB_SHA" \
+              --title "Apifox ${VERSION}" \
+              --notes "Mirrored official Linux packages for stable downstream downloads."
+          fi
+
+          for attempt in 1 2 3; do
+            echo "=== 上传 Release 资产 (第 ${attempt}/3 次尝试) ==="
+            if gh release upload "$TAG" \
+                 "$X86_64_ZIP" "$AARCH64_ZIP" "$WORK_DIR/SHA256SUMS" --clobber; then
+              X86_64_SIZE=$(gh release view "$TAG" --json assets \
+                --jq ".assets[] | select(.name == \"${X86_64_NAME}\") | .size")
+              AARCH64_SIZE=$(gh release view "$TAG" --json assets \
+                --jq ".assets[] | select(.name == \"${AARCH64_NAME}\") | .size")
+              CHECKSUM_SIZE=$(gh release view "$TAG" --json assets \
+                --jq '.assets[] | select(.name == "SHA256SUMS") | .size')
+
+              if [[ "${X86_64_SIZE:-0}" -ge "$MIN_ZIP_SIZE" && \
+                    "${AARCH64_SIZE:-0}" -ge "$MIN_ZIP_SIZE" && \
+                    "${CHECKSUM_SIZE:-0}" -gt 0 ]]; then
+                echo "Release $TAG 上传并校验完成"
+                exit 0
+              fi
+              echo "错误: Release 资产大小校验失败"
+            else
+              echo "错误: Release 资产上传失败"
+            fi
+
+            if (( attempt < 3 )); then
+              sleep $((attempt * 15))
+            fi
+          done
+
+          exit 1
