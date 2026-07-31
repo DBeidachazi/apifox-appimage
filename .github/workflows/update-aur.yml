@@ -2,13 +2,20 @@ name: Update AUR Package
 
 on:
   schedule:
-    # 每天 UTC 时间 2:00 运行 (北京时间 10:00)
+    # GitHub Release 镜像任务在北京时间 9:00 运行，本任务在 10:00 消费其产物。
     - cron: '0 2 * * *'
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 permissions:
   contents: write
   actions: write
+
+env:
+  MIN_ZIP_SIZE: 104857600
+
+concurrency:
+  group: apifox-aur-update
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -18,103 +25,128 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get latest Apifox version
-        id: get_version
+      - name: Validate latest GitHub release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          for attempt in 1 2 3; do
-            echo "=== 获取版本信息 (第 ${attempt}/3 次尝试) ==="
+          set -euo pipefail
 
-            # 清理上次尝试的残留
-            rm -rf /tmp/apifox.zip /tmp/Apifox.AppImage /tmp/README.md /tmp/squashfs-root
+          RELEASE_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest")
+          TAG=$(jq -r '.tag_name // empty' <<< "$RELEASE_JSON")
+          VERSION="${TAG#v}"
 
-            # 下载 zip 文件（curl 自带重试 + 外层重试）
-            echo "下载 Apifox zip..."
-            if ! curl --retry 3 --retry-delay 5 --retry-all-errors -fsSL \
-                 "https://file-assets.apifox.com/download/Apifox-linux-latest.zip" -o /tmp/apifox.zip; then
-              echo "下载失败"
-              if [ $attempt -lt 3 ]; then sleep $((attempt * 15)); continue; fi
-              exit 1
-            fi
-
-            # 解压
-            cd /tmp
-            if ! unzip -q apifox.zip; then
-              echo "解压失败"
-              if [ $attempt -lt 3 ]; then sleep $((attempt * 15)); continue; fi
-              exit 1
-            fi
-
-            chmod +x Apifox.AppImage
-
-            # 从 AppImage 中提取 package.json
-            if ! ./Apifox.AppImage --appimage-extract resources/app.asar.unpacked/package.json; then
-              echo "AppImage 提取失败"
-              if [ $attempt -lt 3 ]; then sleep $((attempt * 15)); continue; fi
-              exit 1
-            fi
-
-            # 从 package.json 读取版本号
-            VERSION=$(grep -oP '"version":\s*"\K[0-9.]+' squashfs-root/resources/app.asar.unpacked/package.json)
-
-            if [ -z "$VERSION" ]; then
-              echo "无法获取版本号"
-              if [ $attempt -lt 3 ]; then sleep $((attempt * 15)); continue; fi
-              exit 1
-            fi
-
-            echo "最新版本: $VERSION"
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-            # 清理
-            rm -rf /tmp/apifox.zip /tmp/Apifox.AppImage /tmp/README.md /tmp/squashfs-root
-            break
-          done
-
-      - name: Get current version from PKGBUILD
-        id: current_version
-        run: |
-          CURRENT=$(grep -oP '^pkgver=\K[0-9.]+' PKGBUILD)
-          echo "当前版本: $CURRENT"
-          echo "version=$CURRENT" >> $GITHUB_OUTPUT
-
-      - name: Check if update needed
-        id: check_update
-        run: |
-          if [ "${{ steps.get_version.outputs.version }}" != "${{ steps.current_version.outputs.version }}" ]; then
-            echo "需要更新: ${{ steps.current_version.outputs.version }} -> ${{ steps.get_version.outputs.version }}"
-            echo "need_update=true" >> $GITHUB_OUTPUT
-          else
-            echo "版本相同，无需更新"
-            echo "need_update=false" >> $GITHUB_OUTPUT
+          if [[ ! "$TAG" =~ ^v[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "错误: 最新 Release tag 无效: ${TAG:-空}"
+            exit 1
           fi
 
-      - name: Update PKGBUILD
-        if: steps.check_update.outputs.need_update == 'true'
+          X86_64_NAME="Apifox-linux-${VERSION}.zip"
+          AARCH64_NAME="Apifox-linux-${VERSION}-arm64.zip"
+
+          asset_value() {
+            local name="$1"
+            local field="$2"
+            jq -r --arg name "$name" \
+              ".assets[] | select(.name == \$name) | .${field}" <<< "$RELEASE_JSON"
+          }
+
+          X86_64_SIZE=$(asset_value "$X86_64_NAME" size)
+          AARCH64_SIZE=$(asset_value "$AARCH64_NAME" size)
+          X86_64_DIGEST=$(asset_value "$X86_64_NAME" digest)
+          AARCH64_DIGEST=$(asset_value "$AARCH64_NAME" digest)
+
+          if [[ ! "$X86_64_SIZE" =~ ^[0-9]+$ || "$X86_64_SIZE" -lt "$MIN_ZIP_SIZE" ]]; then
+            echo "错误: $X86_64_NAME 资产缺失或体积异常: ${X86_64_SIZE:-空} bytes"
+            exit 1
+          fi
+          if [[ ! "$AARCH64_SIZE" =~ ^[0-9]+$ || "$AARCH64_SIZE" -lt "$MIN_ZIP_SIZE" ]]; then
+            echo "错误: $AARCH64_NAME 资产缺失或体积异常: ${AARCH64_SIZE:-空} bytes"
+            exit 1
+          fi
+          if [[ ! "$X86_64_DIGEST" =~ ^sha256:[0-9a-f]{64}$ || \
+                ! "$AARCH64_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "错误: Release 资产缺少有效的 GitHub SHA-256 digest"
+            exit 1
+          fi
+
+          CHECKSUM_DIR="$RUNNER_TEMP/apifox-checksums"
+          mkdir -p "$CHECKSUM_DIR"
+          for attempt in 1 2 3; do
+            rm -f "$CHECKSUM_DIR/SHA256SUMS"
+            if gh release download "$TAG" --pattern SHA256SUMS --dir "$CHECKSUM_DIR"; then
+              break
+            fi
+            echo "SHA256SUMS 下载失败 (第 ${attempt}/3 次尝试)"
+            if (( attempt < 3 )); then sleep $((attempt * 5)); continue; fi
+            exit 1
+          done
+
+          X86_64_SHA256=$(awk -v name="$X86_64_NAME" '$2 == name { print $1 }' "$CHECKSUM_DIR/SHA256SUMS")
+          AARCH64_SHA256=$(awk -v name="$AARCH64_NAME" '$2 == name { print $1 }' "$CHECKSUM_DIR/SHA256SUMS")
+
+          if [[ "sha256:${X86_64_SHA256}" != "$X86_64_DIGEST" || \
+                "sha256:${AARCH64_SHA256}" != "$AARCH64_DIGEST" ]]; then
+            echo "错误: SHA256SUMS 与 GitHub 资产 digest 不一致"
+            exit 1
+          fi
+
+          echo "Release $TAG 校验通过"
+          echo "x86_64: ${X86_64_SIZE} bytes, ${X86_64_SHA256}"
+          echo "aarch64: ${AARCH64_SIZE} bytes, ${AARCH64_SHA256}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "x86_64_sha256=$X86_64_SHA256" >> "$GITHUB_OUTPUT"
+          echo "aarch64_sha256=$AARCH64_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Reconcile package metadata
+        id: package
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          X86_64_SHA256: ${{ steps.release.outputs.x86_64_sha256 }}
+          AARCH64_SHA256: ${{ steps.release.outputs.aarch64_sha256 }}
+        shell: bash
         run: |
-          NEW_VERSION="${{ steps.get_version.outputs.version }}"
+          bash .github/scripts/update-package-metadata.sh \
+            "$VERSION" "$X86_64_SHA256" "$AARCH64_SHA256" "$GITHUB_REPOSITORY"
 
-          # 更新 PKGBUILD 中的版本号
-          sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" PKGBUILD
-
-      - name: Update .SRCINFO
-        if: steps.check_update.outputs.need_update == 'true'
+      - name: Compare AUR package
+        id: aur
+        shell: bash
         run: |
-          NEW_VERSION="${{ steps.get_version.outputs.version }}"
+          set -euo pipefail
 
-          # 更新 .SRCINFO 中的版本号
-          sed -i "s/pkgver = .*/pkgver = $NEW_VERSION/" .SRCINFO
-          # 更新两条 source 行中的版本号（x86_64 / aarch64）
-          sed -i "s/source_x86_64 = Apifox-linux-[0-9.]*\.zip/source_x86_64 = Apifox-linux-$NEW_VERSION.zip/" .SRCINFO
-          sed -i "s/source_aarch64 = Apifox-linux-[0-9.]*-arm64\.zip/source_aarch64 = Apifox-linux-$NEW_VERSION-arm64.zip/" .SRCINFO
+          AUR_DIR="$RUNNER_TEMP/aur-repo"
+          for attempt in 1 2 3; do
+            rm -rf "$AUR_DIR"
+            if git clone https://aur.archlinux.org/apifox-appimage.git "$AUR_DIR"; then
+              break
+            fi
+            echo "AUR 仓库克隆失败 (第 ${attempt}/3 次尝试)"
+            if (( attempt < 3 )); then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done
+
+          cp PKGBUILD .SRCINFO "$AUR_DIR/"
+          git -C "$AUR_DIR" add PKGBUILD .SRCINFO
+
+          if git -C "$AUR_DIR" diff --staged --quiet; then
+            echo "AUR 软件包已是最新状态"
+            echo "need_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "AUR 软件包需要同步"
+            git -C "$AUR_DIR" diff --staged --stat
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "dir=$AUR_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Setup SSH for AUR
-        if: steps.check_update.outputs.need_update == 'true'
+        if: steps.aur.outputs.need_update == 'true'
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
 
-          # 添加 AUR 到 known_hosts（带重试）
           for attempt in 1 2 3; do
             if ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null; then
               break
@@ -124,7 +156,6 @@ jobs:
             exit 1
           done
 
-          # 配置 SSH
           cat >> ~/.ssh/config << EOF
           Host aur.archlinux.org
             IdentityFile ~/.ssh/aur
@@ -132,69 +163,52 @@ jobs:
           EOF
 
       - name: Push to AUR
-        if: steps.check_update.outputs.need_update == 'true'
+        if: steps.aur.outputs.need_update == 'true'
+        env:
+          AUR_DIR: ${{ steps.aur.outputs.dir }}
+          VERSION: ${{ steps.package.outputs.version }}
+          PKGREL: ${{ steps.package.outputs.pkgrel }}
+        shell: bash
         run: |
-          NEW_VERSION="${{ steps.get_version.outputs.version }}"
+          set -euo pipefail
 
-          # 配置 git
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "actions@github.com"
+          git -C "$AUR_DIR" config user.name "GitHub Actions Bot"
+          git -C "$AUR_DIR" config user.email "actions@github.com"
+          git -C "$AUR_DIR" remote set-url origin ssh://aur@aur.archlinux.org/apifox-appimage.git
+          git -C "$AUR_DIR" commit -m "Update to ${VERSION}-${PKGREL}"
 
-          # 克隆 AUR 仓库（带重试）
           for attempt in 1 2 3; do
-            if git clone ssh://aur@aur.archlinux.org/apifox-appimage.git /tmp/aur-repo; then
+            if git -C "$AUR_DIR" push origin master; then
               break
             fi
-            echo "AUR 仓库克隆失败 (第 ${attempt}/3 次尝试)"
-            rm -rf /tmp/aur-repo
-            if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
+            echo "AUR 推送失败 (第 ${attempt}/3 次尝试)"
+            if (( attempt < 3 )); then sleep $((attempt * 10)); continue; fi
             exit 1
           done
 
-          # 复制更新后的文件
-          cp PKGBUILD /tmp/aur-repo/
-          cp .SRCINFO /tmp/aur-repo/
-
-          # 提交并推送（如果有变化）
-          cd /tmp/aur-repo
-          git add PKGBUILD .SRCINFO
-          git diff --staged --quiet || git commit -m "Update to version $NEW_VERSION"
-
-          # 推送到 AUR（带重试）
-          if ! git diff origin/master --quiet; then
-            for attempt in 1 2 3; do
-              if git push; then
-                break
-              fi
-              echo "AUR 推送失败 (第 ${attempt}/3 次尝试)"
-              if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
-              exit 1
-            done
-          fi
-
-      - name: Commit to GitHub
-        if: steps.check_update.outputs.need_update == 'true'
+      - name: Commit package metadata to GitHub
+        if: steps.package.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+          PKGREL: ${{ steps.package.outputs.pkgrel }}
+        shell: bash
         run: |
-          NEW_VERSION="${{ steps.get_version.outputs.version }}"
+          set -euo pipefail
 
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
-
           git add PKGBUILD .SRCINFO
-          # 只在有变化时提交
-          git diff --staged --quiet || git commit -m "Update to version $NEW_VERSION"
+          git commit -m "Update to ${VERSION}-${PKGREL}"
 
-          # 推送到 GitHub（带重试）
           for attempt in 1 2 3; do
-            if git pull --rebase origin master && git push; then
+            if git pull --rebase origin master && git push origin master; then
               break
             fi
             echo "GitHub 推送失败 (第 ${attempt}/3 次尝试)"
-            if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
+            if (( attempt < 3 )); then sleep $((attempt * 10)); continue; fi
             exit 1
           done
 
-  # 工作流级别重试：任何步骤失败后自动重新运行整个工作流（最多 3 次）
   retry:
     needs: update
     if: failure() && github.run_attempt < 3

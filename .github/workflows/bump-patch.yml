@@ -1,11 +1,15 @@
-name: Bump Patch Version
+name: Bump Package Release
 
 on:
-  workflow_dispatch:  # 仅手动触发
+  workflow_dispatch:
 
 permissions:
   contents: write
   actions: write
+
+concurrency:
+  group: apifox-aur-update
+  cancel-in-progress: false
 
 jobs:
   bump:
@@ -15,46 +19,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Compute new patch version
+      - name: Bump pkgrel
         id: bump
+        shell: bash
         run: |
-          CURRENT=$(grep -oP '^pkgver=\K[0-9.]+' PKGBUILD)
-          echo "当前版本: $CURRENT"
+          set -euo pipefail
 
-          # 统计版本号的段数（用点的数量 + 1）
-          DOTS=$(echo -n "$CURRENT" | tr -cd '.' | wc -c)
-          SEGMENTS=$((DOTS + 1))
+          VERSION=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          CURRENT_PKGREL=$(sed -n 's/^pkgrel=//p' PKGBUILD)
 
-          if [ "$SEGMENTS" -eq 3 ]; then
-            # 三段：X.Y.Z -> X.Y.Z.1
-            NEW="${CURRENT}.1"
-          elif [ "$SEGMENTS" -eq 4 ]; then
-            # 四段：X.Y.Z.N -> X.Y.Z.(N+1)
-            BASE=$(echo "$CURRENT" | awk -F. '{print $1"."$2"."$3}')
-            LAST=$(echo "$CURRENT" | awk -F. '{print $4}')
-            NEW="${BASE}.$((LAST + 1))"
-          else
-            echo "不支持的版本格式: $CURRENT（仅支持三段或四段）"
+          if [[ ! "$CURRENT_PKGREL" =~ ^[0-9]+$ ]]; then
+            echo "不支持的 pkgrel: $CURRENT_PKGREL"
             exit 1
           fi
 
-          echo "新版本: $NEW"
-          echo "current=$CURRENT" >> $GITHUB_OUTPUT
-          echo "new=$NEW" >> $GITHUB_OUTPUT
+          NEW_PKGREL=$((CURRENT_PKGREL + 1))
+          sed -i "s/^pkgrel=.*/pkgrel=${NEW_PKGREL}/" PKGBUILD
+          sed -i "s/^[[:space:]]*pkgrel = .*/\tpkgrel = ${NEW_PKGREL}/" .SRCINFO
 
-      - name: Update PKGBUILD
-        run: |
-          NEW_VERSION="${{ steps.bump.outputs.new }}"
-          sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-
-      - name: Update .SRCINFO
-        run: |
-          NEW_VERSION="${{ steps.bump.outputs.new }}"
-          sed -i "s/pkgver = .*/pkgver = $NEW_VERSION/" .SRCINFO
-          sed -i "s/pkgrel = .*/pkgrel = 1/" .SRCINFO
-          sed -i "s/source_x86_64 = Apifox-linux-[0-9.]*\.zip/source_x86_64 = Apifox-linux-$NEW_VERSION.zip/" .SRCINFO
-          sed -i "s/source_aarch64 = Apifox-linux-[0-9.]*-arm64\.zip/source_aarch64 = Apifox-linux-$NEW_VERSION-arm64.zip/" .SRCINFO
+          echo "软件包版本: ${VERSION}-${CURRENT_PKGREL} -> ${VERSION}-${NEW_PKGREL}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "pkgrel=$NEW_PKGREL" >> "$GITHUB_OUTPUT"
 
       - name: Setup SSH for AUR
         run: |
@@ -62,7 +47,6 @@ jobs:
           echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
 
-          # 添加 AUR 到 known_hosts（带重试）
           for attempt in 1 2 3; do
             if ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null; then
               break
@@ -79,13 +63,13 @@ jobs:
           EOF
 
       - name: Push to AUR
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          PKGREL: ${{ steps.bump.outputs.pkgrel }}
         run: |
-          NEW_VERSION="${{ steps.bump.outputs.new }}"
-
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
 
-          # 克隆 AUR 仓库（带重试）
           for attempt in 1 2 3; do
             if git clone ssh://aur@aur.archlinux.org/apifox-appimage.git /tmp/aur-repo; then
               break
@@ -96,12 +80,10 @@ jobs:
             exit 1
           done
 
-          cp PKGBUILD /tmp/aur-repo/
-          cp .SRCINFO /tmp/aur-repo/
-
+          cp PKGBUILD .SRCINFO /tmp/aur-repo/
           cd /tmp/aur-repo
           git add PKGBUILD .SRCINFO
-          git diff --staged --quiet || git commit -m "Bump patch to $NEW_VERSION"
+          git diff --staged --quiet || git commit -m "Bump pkgrel to ${VERSION}-${PKGREL}"
 
           if ! git diff origin/master --quiet; then
             for attempt in 1 2 3; do
@@ -115,14 +97,15 @@ jobs:
           fi
 
       - name: Commit to GitHub
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          PKGREL: ${{ steps.bump.outputs.pkgrel }}
         run: |
-          NEW_VERSION="${{ steps.bump.outputs.new }}"
-
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
 
           git add PKGBUILD .SRCINFO
-          git diff --staged --quiet || git commit -m "Bump patch to $NEW_VERSION"
+          git diff --staged --quiet || git commit -m "Bump pkgrel to ${VERSION}-${PKGREL}"
 
           for attempt in 1 2 3; do
             if git pull --rebase origin master && git push; then
