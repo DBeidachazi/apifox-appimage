@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Bump pkgrel
         id: bump
@@ -115,21 +115,3 @@ jobs:
             if [ $attempt -lt 3 ]; then sleep $((attempt * 10)); continue; fi
             exit 1
           done
-
-  retry:
-    needs: bump
-    if: failure() && github.run_attempt < 3
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-    steps:
-      - name: 重新运行失败的任务
-        uses: actions/github-script@v7
-        with:
-          script: |
-            console.log('第 ${{ github.run_attempt }} 次尝试失败，正在触发重试...');
-            await github.rest.actions.rerunWorkflowFailedJobs({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.runId
-            });
