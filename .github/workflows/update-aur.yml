@@ -142,7 +142,6 @@ jobs:
           echo "dir=$AUR_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Setup SSH for AUR
-        if: steps.aur.outputs.need_update == 'true'
         run: |
           unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
           mkdir -p ~/.ssh
@@ -166,7 +165,6 @@ jobs:
           EOF
 
       - name: Push to AUR
-        if: steps.aur.outputs.need_update == 'true'
         env:
           AUR_DIR: ${{ steps.aur.outputs.dir }}
           VERSION: ${{ steps.package.outputs.version }}
@@ -179,10 +177,13 @@ jobs:
           git -C "$AUR_DIR" config user.name "GitHub Actions Bot"
           git -C "$AUR_DIR" config user.email "actions@github.com"
           git -C "$AUR_DIR" remote set-url origin ssh://aur@aur.archlinux.org/apifox-appimage.git
-          git -C "$AUR_DIR" commit -m "Update to ${VERSION}-${PKGREL}"
+          if [[ "${{ steps.aur.outputs.need_update }}" == "true" ]]; then
+            git -C "$AUR_DIR" commit -m "Update to ${VERSION}-${PKGREL}"
+          fi
 
           for attempt in 1 2 3; do
             if git -C "$AUR_DIR" push origin master; then
+              echo "AUR SSH 写入通道验证通过"
               break
             fi
             echo "AUR 推送失败 (第 ${attempt}/3 次尝试)"
